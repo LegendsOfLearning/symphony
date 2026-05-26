@@ -1364,6 +1364,18 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_method("tool/requestUserInput", payload),
     do: humanize_codex_method("item/tool/requestUserInput", payload)
 
+  defp humanize_codex_method("mcpServer/elicitation/request", payload) do
+    question =
+      map_path(payload, ["params", "question"]) ||
+        map_path(payload, ["params", "prompt"])
+
+    if is_binary(question) and String.trim(question) != "" do
+      "MCP server requires user input: #{inline_text(question)}"
+    else
+      "MCP server requires user input"
+    end
+  end
+
   defp humanize_codex_method("account/updated", payload) do
     auth_mode =
       map_path(payload, ["params", "authMode"]) ||
