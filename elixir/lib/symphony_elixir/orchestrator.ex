@@ -1014,6 +1014,7 @@ defmodule SymphonyElixir.Orchestrator do
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
+    delay_type = Map.get(metadata, :delay_type)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
 
@@ -1023,9 +1024,13 @@ defmodule SymphonyElixir.Orchestrator do
 
     timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
 
-    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+    if delay_type == :slot_wait do
+      Logger.info("Waiting for capacity issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms")
+    else
+      error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+      Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+    end
 
     %{
       state
@@ -1037,6 +1042,7 @@ defmodule SymphonyElixir.Orchestrator do
             due_at_ms: due_at_ms,
             identifier: identifier,
             error: error,
+            delay_type: delay_type,
             worker_host: worker_host,
             workspace_path: workspace_path
           })
@@ -1386,6 +1392,7 @@ defmodule SymphonyElixir.Orchestrator do
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
           error: Map.get(retry, :error),
+          delay_type: Map.get(retry, :delay_type),
           worker_host: Map.get(retry, :worker_host),
           workspace_path: Map.get(retry, :workspace_path)
         }

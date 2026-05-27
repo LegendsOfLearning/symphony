@@ -651,12 +651,36 @@ defmodule SymphonyElixir.StatusDashboard do
     else
       retrying
       |> Enum.sort_by(& &1.due_in_ms)
-      |> Enum.map_join(", ", &format_retry_summary/1)
-      |> String.split(", ")
+      |> Enum.map(&format_retry_summary/1)
+    end
+  end
+
+  defp format_retry_summary(%{} = retry_entry) do
+    if capacity_wait_entry?(retry_entry) do
+      format_capacity_wait_summary(retry_entry)
+    else
+      format_backoff_retry_summary(retry_entry)
     end
   end
 
   defp format_retry_summary(retry_entry) do
+    format_backoff_retry_summary(retry_entry)
+  end
+
+  defp format_capacity_wait_summary(retry_entry) do
+    issue_id = retry_entry.issue_id || "unknown"
+    identifier = retry_entry.identifier || issue_id
+    due_in_ms = retry_entry.due_in_ms || 0
+
+    "│  #{colorize("…", @ansi_cyan)} " <>
+      colorize("#{identifier}", @ansi_cyan) <>
+      " " <>
+      colorize("waiting for capacity", @ansi_yellow) <>
+      colorize(" in ", @ansi_dim) <>
+      colorize(next_in_words(due_in_ms), @ansi_cyan)
+  end
+
+  defp format_backoff_retry_summary(retry_entry) do
     issue_id = retry_entry.issue_id || "unknown"
     identifier = retry_entry.identifier || issue_id
     attempt = retry_entry.attempt || 0
@@ -670,6 +694,13 @@ defmodule SymphonyElixir.StatusDashboard do
       colorize(" in ", @ansi_dim) <>
       colorize(next_in_words(due_in_ms), @ansi_cyan) <>
       error
+  end
+
+  defp capacity_wait_entry?(%{} = retry_entry) do
+    delay_type = Map.get(retry_entry, :delay_type)
+
+    delay_type in [:slot_wait, "slot_wait"] ||
+      Map.get(retry_entry, :error) == "waiting for available orchestrator slot"
   end
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
