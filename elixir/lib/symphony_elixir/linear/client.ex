@@ -117,7 +117,7 @@ defmodule SymphonyElixir.Linear.Client do
 
       true ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
+          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter, required_label_filter())
         end
     end
   end
@@ -140,7 +140,7 @@ defmodule SymphonyElixir.Linear.Client do
           {:error, :missing_linear_project_slug}
 
         true ->
-          do_fetch_by_states(project_slug, normalized_states, nil)
+          do_fetch_by_states(project_slug, normalized_states, nil, nil)
       end
     end
   end
@@ -155,7 +155,7 @@ defmodule SymphonyElixir.Linear.Client do
 
       ids ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_issue_states(ids, assignee_filter)
+          do_fetch_issue_states(ids, assignee_filter, required_label_filter())
         end
     end
   end
@@ -232,15 +232,42 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
 
       ids ->
-        do_fetch_issue_states(ids, nil, graphql_fun)
+        do_fetch_issue_states(ids, nil, nil, graphql_fun)
     end
   end
 
-  defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  @doc false
+  @spec fetch_issue_states_by_ids_for_test(
+          [String.t()],
+          (String.t(), map() -> {:ok, map()} | {:error, term()}),
+          [String.t()]
+        ) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issue_states_by_ids_for_test(issue_ids, graphql_fun, required_labels)
+      when is_list(issue_ids) and is_function(graphql_fun, 2) and is_list(required_labels) do
+    ids = Enum.uniq(issue_ids)
+
+    label_filter =
+      required_labels
+      |> normalize_required_labels()
+      |> case do
+        [] -> nil
+        labels -> MapSet.new(labels)
+      end
+
+    case ids do
+      [] ->
+        {:ok, []}
+
+      ids ->
+        do_fetch_issue_states(ids, nil, label_filter, graphql_fun)
+    end
   end
 
-  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp do_fetch_by_states(project_slug, state_names, assignee_filter, label_filter) do
+    do_fetch_by_states_page(project_slug, state_names, assignee_filter, label_filter, nil, [])
+  end
+
+  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, label_filter, after_cursor, acc_issues) do
     with {:ok, body} <-
            graphql(@query, %{
              projectSlug: project_slug,
@@ -249,12 +276,12 @@ defmodule SymphonyElixir.Linear.Client do
              relationFirst: @issue_page_size,
              after: after_cursor
            }),
-         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
+         {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter, label_filter) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slug, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(project_slug, state_names, assignee_filter, label_filter, next_cursor, updated_acc)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -271,24 +298,24 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp finalize_paginated_issues(acc_issues) when is_list(acc_issues), do: Enum.reverse(acc_issues)
 
-  defp do_fetch_issue_states(ids, assignee_filter) do
-    do_fetch_issue_states(ids, assignee_filter, &graphql/2)
+  defp do_fetch_issue_states(ids, assignee_filter, label_filter) do
+    do_fetch_issue_states(ids, assignee_filter, label_filter, &graphql/2)
   end
 
-  defp do_fetch_issue_states(ids, assignee_filter, graphql_fun)
+  defp do_fetch_issue_states(ids, assignee_filter, label_filter, graphql_fun)
        when is_list(ids) and is_function(graphql_fun, 2) do
     issue_order_index = issue_order_index(ids)
-    do_fetch_issue_states_page(ids, assignee_filter, graphql_fun, [], issue_order_index)
+    do_fetch_issue_states_page(ids, assignee_filter, label_filter, graphql_fun, [], issue_order_index)
   end
 
-  defp do_fetch_issue_states_page([], _assignee_filter, _graphql_fun, acc_issues, issue_order_index) do
+  defp do_fetch_issue_states_page([], _assignee_filter, _label_filter, _graphql_fun, acc_issues, issue_order_index) do
     acc_issues
     |> finalize_paginated_issues()
     |> sort_issues_by_requested_ids(issue_order_index)
     |> then(&{:ok, &1})
   end
 
-  defp do_fetch_issue_states_page(ids, assignee_filter, graphql_fun, acc_issues, issue_order_index) do
+  defp do_fetch_issue_states_page(ids, assignee_filter, label_filter, graphql_fun, acc_issues, issue_order_index) do
     {batch_ids, rest_ids} = Enum.split(ids, @issue_page_size)
 
     case graphql_fun.(@query_by_ids, %{
@@ -297,9 +324,9 @@ defmodule SymphonyElixir.Linear.Client do
            relationFirst: @issue_page_size
          }) do
       {:ok, body} ->
-        with {:ok, issues} <- decode_linear_response(body, assignee_filter) do
+        with {:ok, issues} <- decode_linear_response(body, assignee_filter, label_filter) do
           updated_acc = prepend_page_issues(issues, acc_issues)
-          do_fetch_issue_states_page(rest_ids, assignee_filter, graphql_fun, updated_acc, issue_order_index)
+          do_fetch_issue_states_page(rest_ids, assignee_filter, label_filter, graphql_fun, updated_acc, issue_order_index)
         end
 
       {:error, reason} ->
@@ -402,20 +429,21 @@ defmodule SymphonyElixir.Linear.Client do
     )
   end
 
-  defp decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
+  defp decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter, label_filter) do
     issues =
       nodes
       |> Enum.map(&normalize_issue(&1, assignee_filter))
       |> Enum.reject(&is_nil(&1))
+      |> filter_by_required_labels(label_filter)
 
     {:ok, issues}
   end
 
-  defp decode_linear_response(%{"errors" => errors}, _assignee_filter) do
+  defp decode_linear_response(%{"errors" => errors}, _assignee_filter, _label_filter) do
     {:error, {:linear_graphql_errors, errors}}
   end
 
-  defp decode_linear_response(_unknown, _assignee_filter) do
+  defp decode_linear_response(_unknown, _assignee_filter, _label_filter) do
     {:error, :linear_unknown_payload}
   end
 
@@ -428,14 +456,16 @@ defmodule SymphonyElixir.Linear.Client do
              }
            }
          },
-         assignee_filter
+         assignee_filter,
+         label_filter
        ) do
-    with {:ok, issues} <- decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
+    with {:ok, issues} <- decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter, label_filter) do
       {:ok, issues, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
     end
   end
 
-  defp decode_linear_page_response(response, assignee_filter), do: decode_linear_response(response, assignee_filter)
+  defp decode_linear_page_response(response, assignee_filter, label_filter),
+    do: decode_linear_response(response, assignee_filter, label_filter)
 
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
        when is_binary(end_cursor) and byte_size(end_cursor) > 0 do
@@ -495,6 +525,47 @@ defmodule SymphonyElixir.Linear.Client do
       assignee ->
         build_assignee_filter(assignee)
     end
+  end
+
+  defp required_label_filter do
+    Config.settings!().tracker.required_labels
+    |> normalize_required_labels()
+    |> case do
+      [] -> nil
+      labels -> MapSet.new(labels)
+    end
+  end
+
+  defp normalize_required_labels(labels) when is_list(labels) do
+    labels
+    |> Enum.map(&normalize_label_name/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_required_labels(_labels), do: []
+
+  defp normalize_label_name(value) when is_binary(value) do
+    case value |> String.trim() |> String.downcase() do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_label_name(_value), do: nil
+
+  defp filter_by_required_labels(issues, nil) when is_list(issues), do: issues
+
+  defp filter_by_required_labels(issues, required_labels)
+       when is_list(issues) and is_struct(required_labels, MapSet) do
+    Enum.filter(issues, fn
+      %Issue{labels: labels} when is_list(labels) ->
+        issue_labels = MapSet.new(labels)
+        MapSet.subset?(required_labels, issue_labels)
+
+      _ ->
+        false
+    end)
   end
 
   defp build_assignee_filter(assignee) when is_binary(assignee) do

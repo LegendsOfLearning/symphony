@@ -429,6 +429,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client filters fetched issue states by required labels" do
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-r3",
+                 "identifier" => "MT-1",
+                 "title" => "Round 3",
+                 "state" => %{"name" => "In Progress"},
+                 "labels" => %{"nodes" => [%{"name" => "PS Feedback R3"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               },
+               %{
+                 "id" => "issue-r2",
+                 "identifier" => "MT-2",
+                 "title" => "Round 2",
+                 "state" => %{"name" => "In Progress"},
+                 "labels" => %{"nodes" => [%{"name" => "PS Feedback R2"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ]
+           }
+         }
+       }}
+    end
+
+    assert {:ok, issues} =
+             Client.fetch_issue_states_by_ids_for_test(
+               ["issue-r3", "issue-r2"],
+               graphql_fun,
+               ["ps feedback r3"]
+             )
+
+    assert Enum.map(issues, & &1.identifier) == ["MT-1"]
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
