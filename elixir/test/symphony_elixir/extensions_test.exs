@@ -363,6 +363,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-retry",
                  "issue_identifier" => "MT-RETRY",
+                 "kind" => "retry",
                  "attempt" => 2,
                  "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
                  "error" => "boom",
@@ -453,6 +454,48 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "observability api labels capacity waits separately from retry failures" do
+    snapshot = %{
+      static_snapshot()
+      | running: [],
+        retrying: [
+          %{
+            issue_id: "issue-capacity",
+            identifier: "MT-CAPACITY",
+            attempt: 0,
+            due_in_ms: 5_000,
+            delay_type: :slot_wait,
+            error: "waiting for available orchestrator slot"
+          }
+        ],
+        blocked: []
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CapacityWaitOrchestrator)
+    {:ok, _pid} = StaticOrchestrator.start_link(name: orchestrator_name, snapshot: snapshot)
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    conn = get(build_conn(), "/api/v1/state")
+
+    assert [
+             %{
+               "issue_identifier" => "MT-CAPACITY",
+               "kind" => "capacity_wait",
+               "attempt" => 0,
+               "error" => "waiting for available orchestrator slot"
+             }
+           ] = json_response(conn, 200)["retrying"]
+
+    conn = get(build_conn(), "/api/v1/MT-CAPACITY")
+
+    assert %{
+             "status" => "waiting_for_slot",
+             "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
+             "last_error" => nil,
+             "retry" => %{"kind" => "capacity_wait"}
+           } = json_response(conn, 200)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do

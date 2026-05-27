@@ -16,6 +16,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.tracker.required_labels == []
     assert config.agent.max_turns == 20
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
@@ -36,6 +37,9 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["PS Feedback R3"])
+    assert Config.settings!().tracker.required_labels == ["PS Feedback R3"]
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -671,6 +675,81 @@ defmodule SymphonyElixir.CoreTest do
              identifier: "MT-561",
              error: "agent exited: :boom"
            } = :sys.get_state(pid).retry_attempts[issue_id]
+  end
+
+  test "retry waiting for an available slot preserves attempt count" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-slot-wait"
+    retry_token = make_ref()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Closed"],
+      max_concurrent_agents: 1,
+      poll_interval_ms: 30_000
+    )
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: issue_id, identifier: "MT-SLOT", title: "Slot wait", state: "In Progress"}
+    ])
+
+    WorkflowStore.force_reload()
+    assert Config.settings!().tracker.kind == "memory"
+    assert {:ok, [%Issue{id: ^issue_id}]} = Tracker.fetch_candidate_issues()
+
+    occupying_worker =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      poll_check_in_progress: false,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil,
+      running: %{
+        "occupied-slot" => %{
+          pid: occupying_worker,
+          ref: nil,
+          identifier: "MT-RUNNING",
+          issue: %Issue{id: "occupied-slot", identifier: "MT-RUNNING", state: "In Progress"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{
+        issue_id => %{
+          attempt: 4,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: "MT-SLOT",
+          error: "agent exited: :boom"
+        }
+      }
+    }
+
+    assert {:noreply, state} = Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+
+    assert %{
+             attempt: 4,
+             timer_ref: timer_ref,
+             due_at_ms: due_at_ms,
+             identifier: "MT-SLOT",
+             error: "waiting for available orchestrator slot"
+           } = state.retry_attempts[issue_id]
+
+    assert is_reference(timer_ref)
+    assert_due_in_range(due_at_ms, 4_500, 5_500)
+    Process.cancel_timer(timer_ref)
+    send(occupying_worker, :stop)
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
