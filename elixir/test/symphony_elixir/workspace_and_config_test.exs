@@ -429,6 +429,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client filters fetched issue states by required labels" do
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-r3",
+                 "identifier" => "MT-1",
+                 "title" => "Round 3",
+                 "state" => %{"name" => "In Progress"},
+                 "labels" => %{"nodes" => [%{"name" => "PS Feedback R3"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               },
+               %{
+                 "id" => "issue-r2",
+                 "identifier" => "MT-2",
+                 "title" => "Round 2",
+                 "state" => %{"name" => "In Progress"},
+                 "labels" => %{"nodes" => [%{"name" => "PS Feedback R2"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ]
+           }
+         }
+       }}
+    end
+
+    assert {:ok, issues} =
+             Client.fetch_issue_states_by_ids_for_test(
+               ["issue-r3", "issue-r2"],
+               graphql_fun,
+               ["ps feedback r3"]
+             )
+
+    assert Enum.map(issues, & &1.identifier) == ["MT-1"]
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -456,6 +495,55 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Linear GraphQL request failed status=400"
     assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
+  end
+
+  test "linear client classifies Linear rate limits instead of generic graphql failures" do
+    assert {:error, {:linear_rate_limited, details}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 400,
+                    body: %{
+                      "errors" => [
+                        %{
+                          "message" => "Rate limit exceeded",
+                          "extensions" => %{
+                            "code" => "RATELIMITED",
+                            "limit" => 2500,
+                            "remaining" => 0,
+                            "duration_ms" => 3_600_000
+                          }
+                        }
+                      ]
+                    }
+                  }}
+               end
+             )
+
+    assert details.code == "RATELIMITED"
+    assert details.limit == 2500
+    assert details.remaining == 0
+    assert details.duration_ms == 3_600_000
+  end
+
+  test "linear issue decoders preserve rate limit details from graphql error payloads" do
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "errors" => [
+           %{
+             "message" => "Rate limit exceeded",
+             "extensions" => %{"code" => "RATELIMITED", "durationMs" => "60000"}
+           }
+         ]
+       }}
+    end
+
+    assert {:error, {:linear_rate_limited, %{duration_ms: "60000"}}} =
+             Client.fetch_issue_states_by_ids_for_test(["issue-1"], graphql_fun)
   end
 
   test "orchestrator sorts dispatch by priority then oldest created_at" do

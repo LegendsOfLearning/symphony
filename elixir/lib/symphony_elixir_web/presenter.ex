@@ -83,7 +83,7 @@ defmodule SymphonyElixirWeb.Presenter do
         codex_session_logs: []
       },
       recent_events: recent_events_payload(running || blocked),
-      last_error: (blocked && blocked.error) || (retry && retry.error),
+      last_error: (blocked && blocked.error) || retry_last_error(retry),
       tracked: %{}
     }
   end
@@ -96,7 +96,11 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(retry), do: retry.attempt || 0
 
   defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
-  defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
+
+  defp issue_status(nil, retry, _blocked) when not is_nil(retry) do
+    if capacity_wait_entry?(retry), do: "waiting_for_slot", else: "retrying"
+  end
+
   defp issue_status(nil, nil, _blocked), do: "blocked"
 
   defp running_entry_payload(entry) do
@@ -124,6 +128,7 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      kind: retry_kind(entry),
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
       error: entry.error,
@@ -169,6 +174,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp retry_issue_payload(retry) do
     %{
+      kind: retry_kind(retry),
       attempt: retry.attempt,
       due_at: due_at_iso8601(retry.due_in_ms),
       error: retry.error,
@@ -202,6 +208,23 @@ defmodule SymphonyElixirWeb.Presenter do
     (running && Map.get(running, :worker_host)) ||
       (retry && Map.get(retry, :worker_host)) ||
       (blocked && Map.get(blocked, :worker_host))
+  end
+
+  defp retry_kind(%{} = retry) do
+    if capacity_wait_entry?(retry), do: "capacity_wait", else: "retry"
+  end
+
+  defp retry_last_error(nil), do: nil
+
+  defp retry_last_error(%{} = retry) do
+    if capacity_wait_entry?(retry), do: nil, else: retry.error
+  end
+
+  defp capacity_wait_entry?(%{} = retry) do
+    delay_type = Map.get(retry, :delay_type)
+
+    delay_type in [:slot_wait, "slot_wait"] ||
+      Map.get(retry, :error) == "waiting for available orchestrator slot"
   end
 
   defp recent_events_payload(nil), do: []

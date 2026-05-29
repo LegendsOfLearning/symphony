@@ -86,9 +86,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
-            <p class="metric-label">Retrying</p>
+            <p class="metric-label">Queued</p>
             <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
-            <p class="metric-detail">Issues waiting for the next retry window.</p>
+            <p class="metric-detail">Issues waiting for retry or agent capacity.</p>
           </article>
 
           <article class="metric-card">
@@ -289,22 +289,23 @@ defmodule SymphonyElixirWeb.DashboardLive do
         <section class="section-card">
           <div class="section-header">
             <div>
-              <h2 class="section-title">Retry queue</h2>
-              <p class="section-copy">Issues waiting for the next retry window.</p>
+              <h2 class="section-title">Queue</h2>
+              <p class="section-copy">Issues waiting for retry or agent capacity.</p>
             </div>
           </div>
 
           <%= if @payload.retrying == [] do %>
-            <p class="empty-state">No issues are currently backing off.</p>
+            <p class="empty-state">No issues are currently queued.</p>
           <% else %>
             <div class="table-wrap">
-              <table class="data-table" style="min-width: 680px;">
+              <table class="data-table" style="min-width: 760px;">
                 <thead>
                   <tr>
                     <th>Issue</th>
+                    <th>Type</th>
                     <th>Attempt</th>
                     <th>Due at</th>
-                    <th>Error</th>
+                    <th>Status</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -315,9 +316,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
                       </div>
                     </td>
-                    <td><%= entry.attempt %></td>
+                    <td><%= retry_kind_label(entry) %></td>
+                    <td><%= retry_attempt_label(entry) %></td>
                     <td class="mono"><%= entry.due_at || "n/a" %></td>
-                    <td><%= entry.error || "n/a" %></td>
+                    <td><%= retry_status_label(entry) %></td>
                   </tr>
                 </tbody>
               </table>
@@ -388,6 +390,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_int(_value), do: "n/a"
+
+  defp retry_kind_label(%{kind: "capacity_wait"}), do: "Capacity"
+  defp retry_kind_label(_entry), do: "Retry"
+
+  defp retry_attempt_label(%{kind: "capacity_wait"}), do: "n/a"
+  defp retry_attempt_label(entry), do: entry.attempt || "n/a"
+
+  defp retry_status_label(%{kind: "capacity_wait"}), do: "Waiting for agent capacity"
+  defp retry_status_label(entry), do: entry.error || "n/a"
 
   defp state_badge_class(state) do
     base = "state-badge"

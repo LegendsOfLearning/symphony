@@ -897,6 +897,16 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms <= 50
   end
 
+  test "orchestrator uses Linear rate limit duration for poll backoff" do
+    assert Orchestrator.linear_rate_limit_backoff_ms_for_test(%{duration_ms: 3_600_000}, 30_000) ==
+             3_600_000
+
+    assert Orchestrator.linear_rate_limit_backoff_ms_for_test(%{"retryAfterMs" => "60000"}, 30_000) ==
+             60_000
+
+    assert Orchestrator.linear_rate_limit_backoff_ms_for_test(%{}, 30_000) == 300_000
+  end
+
   test "orchestrator restarts stalled workers with retry backoff" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -1225,6 +1235,25 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     checking_rendered = StatusDashboard.format_snapshot_content_for_test(checking_snapshot, 0.0)
     assert checking_rendered =~ "checking now…"
+  end
+
+  test "status dashboard renders tracker backoff separately from issue retry queue" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil,
+         tracker_backoff: %{reason: :linear_rate_limited, delay_ms: 3_600_000}
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+    plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
+
+    assert plain =~ "Tracker backoff: Linear rate limited"
+    assert plain =~ "next poll in 3600.000s"
+    assert plain =~ "No queued retries"
   end
 
   test "status dashboard adds a spacer line before backoff queue when no agents are active" do

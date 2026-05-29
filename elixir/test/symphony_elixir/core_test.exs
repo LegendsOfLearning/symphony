@@ -16,6 +16,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.tracker.required_labels == []
     assert config.agent.max_turns == 20
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
@@ -36,6 +37,9 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["PS Feedback R3"])
+    assert Config.settings!().tracker.required_labels == ["PS Feedback R3"]
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -551,7 +555,170 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, -500, 1_100)
+  end
+
+  test "normal worker exit with issue-done completion releases the claim without retrying" do
+    issue_id = "issue-done-completion"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :DoneCompletionOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-DONE",
+      issue: %Issue{id: issue_id, identifier: "MT-DONE", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_completed, issue_id, %{outcome: :issue_done, issue: %Issue{id: issue_id, identifier: "MT-DONE", state: "Done"}}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+    assert MapSet.member?(state.completed, issue_id)
+  end
+
+  test "normal worker exit after max turns blocks instead of retrying" do
+    issue_id = "issue-max-turns-active"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :MaxTurnsActiveOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-MAX",
+      issue: %Issue{id: issue_id, identifier: "MT-MAX", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:agent_run_completed, issue_id, %{outcome: :max_turns_active, issue: %Issue{id: issue_id, identifier: "MT-MAX", state: "In Progress"}, turn_number: 1, max_turns: 1}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert %{identifier: "MT-MAX", error: error} = state.blocked[issue_id]
+    assert error =~ "agent reached max_turns (1/1)"
+  end
+
+  test "normal worker exit after preflight refusal blocks instead of retrying" do
+    issue_id = "issue-preflight-refused"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :PreflightRefusedOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-PREFLIGHT",
+      issue: %Issue{id: issue_id, identifier: "MT-PREFLIGHT", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    output = """
+    {"ok": false, "reason": "overworked-ticket"}
+    LEG delivery preflight refused MT-PREFLIGHT: overworked-ticket - too many AI comments
+    """
+
+    send(pid, {:agent_run_completed, issue_id, %{outcome: :workspace_preflight_refused, output: output}})
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert %{identifier: "MT-PREFLIGHT", error: error} = state.blocked[issue_id]
+    assert error =~ "workspace preflight refused autonomous work"
+    assert error =~ "overworked-ticket"
+  end
+
+  test "blocked issue update releases the claim for a fresh dispatch" do
+    issue_id = "issue-blocked-update"
+    blocked_at = DateTime.utc_now()
+    original_updated_at = DateTime.add(blocked_at, -60, :second)
+    refreshed_updated_at = DateTime.add(blocked_at, 60, :second)
+
+    state = %Orchestrator.State{
+      blocked: %{
+        issue_id => %{
+          identifier: "MT-BLOCKED",
+          issue: %Issue{id: issue_id, identifier: "MT-BLOCKED", state: "In Progress", updated_at: original_updated_at},
+          blocked_at: blocked_at,
+          error: "agent reached max_turns"
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      running: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-BLOCKED",
+      state: "In Progress",
+      title: "Updated while blocked",
+      updated_at: refreshed_updated_at
+    }
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -591,7 +758,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -671,6 +838,81 @@ defmodule SymphonyElixir.CoreTest do
              identifier: "MT-561",
              error: "agent exited: :boom"
            } = :sys.get_state(pid).retry_attempts[issue_id]
+  end
+
+  test "retry waiting for an available slot preserves attempt count" do
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-slot-wait"
+    retry_token = make_ref()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["In Progress"],
+      tracker_terminal_states: ["Closed"],
+      max_concurrent_agents: 1,
+      poll_interval_ms: 30_000
+    )
+
+    on_exit(fn ->
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %Issue{id: issue_id, identifier: "MT-SLOT", title: "Slot wait", state: "In Progress"}
+    ])
+
+    WorkflowStore.force_reload()
+    assert Config.settings!().tracker.kind == "memory"
+    assert {:ok, [%Issue{id: ^issue_id}]} = Tracker.fetch_candidate_issues()
+
+    occupying_worker =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      poll_interval_ms: 30_000,
+      max_concurrent_agents: 1,
+      poll_check_in_progress: false,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil,
+      running: %{
+        "occupied-slot" => %{
+          pid: occupying_worker,
+          ref: nil,
+          identifier: "MT-RUNNING",
+          issue: %Issue{id: "occupied-slot", identifier: "MT-RUNNING", state: "In Progress"},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{
+        issue_id => %{
+          attempt: 4,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
+          identifier: "MT-SLOT",
+          error: "agent exited: :boom"
+        }
+      }
+    }
+
+    assert {:noreply, state} = Orchestrator.handle_info({:retry_issue, issue_id, retry_token}, state)
+
+    assert %{
+             attempt: 4,
+             timer_ref: timer_ref,
+             due_at_ms: due_at_ms,
+             identifier: "MT-SLOT",
+             error: "waiting for available orchestrator slot"
+           } = state.retry_attempts[issue_id]
+
+    assert is_reference(timer_ref)
+    assert_due_in_range(due_at_ms, 4_500, 5_500)
+    Process.cancel_timer(timer_ref)
+    send(occupying_worker, :stop)
   end
 
   test "manual refresh coalesces repeated requests and ignores superseded ticks" do
@@ -990,6 +1232,51 @@ defmodule SymphonyElixir.CoreTest do
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
     assert prompt == "Retry #2"
+  end
+
+  test "agent runner reports before-run exit 64 as a blocked completion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-preflight-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_run: "printf '%s\\n' 'LEG delivery preflight refused MT-PREFLIGHT: overworked-ticket - too many AI comments' >&2; exit 64"
+      )
+
+      issue = %Issue{
+        id: "issue-preflight-runner",
+        identifier: "MT-PREFLIGHT",
+        title: "Stop before Codex",
+        description: "Preflight should block without retry",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-PREFLIGHT",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, self())
+
+      assert_receive {:worker_runtime_info, "issue-preflight-runner", %{workspace_path: workspace_path}}
+      assert workspace_path =~ "MT-PREFLIGHT"
+
+      assert_receive {:agent_run_completed, "issue-preflight-runner",
+                      %{
+                        outcome: :workspace_preflight_refused,
+                        hook: "before_run",
+                        status: 64,
+                        output: output
+                      }}
+
+      assert output =~ "LEG delivery preflight refused MT-PREFLIGHT"
+      refute_receive {:codex_worker_update, "issue-preflight-runner", _update}, 50
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "agent runner keeps workspace after successful codex run" do

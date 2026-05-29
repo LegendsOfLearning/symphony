@@ -346,6 +346,7 @@ defmodule SymphonyElixir.StatusDashboard do
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
+        tracker_backoff_line = format_tracker_backoff_line(Map.get(snapshot, :tracker_backoff))
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -363,6 +364,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           tracker_backoff_line,
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
@@ -651,12 +653,36 @@ defmodule SymphonyElixir.StatusDashboard do
     else
       retrying
       |> Enum.sort_by(& &1.due_in_ms)
-      |> Enum.map_join(", ", &format_retry_summary/1)
-      |> String.split(", ")
+      |> Enum.map(&format_retry_summary/1)
+    end
+  end
+
+  defp format_retry_summary(%{} = retry_entry) do
+    if capacity_wait_entry?(retry_entry) do
+      format_capacity_wait_summary(retry_entry)
+    else
+      format_backoff_retry_summary(retry_entry)
     end
   end
 
   defp format_retry_summary(retry_entry) do
+    format_backoff_retry_summary(retry_entry)
+  end
+
+  defp format_capacity_wait_summary(retry_entry) do
+    issue_id = retry_entry.issue_id || "unknown"
+    identifier = retry_entry.identifier || issue_id
+    due_in_ms = retry_entry.due_in_ms || 0
+
+    "│  #{colorize("…", @ansi_cyan)} " <>
+      colorize("#{identifier}", @ansi_cyan) <>
+      " " <>
+      colorize("waiting for capacity", @ansi_yellow) <>
+      colorize(" in ", @ansi_dim) <>
+      colorize(next_in_words(due_in_ms), @ansi_cyan)
+  end
+
+  defp format_backoff_retry_summary(retry_entry) do
     issue_id = retry_entry.issue_id || "unknown"
     identifier = retry_entry.identifier || issue_id
     attempt = retry_entry.attempt || 0
@@ -672,6 +698,13 @@ defmodule SymphonyElixir.StatusDashboard do
       error
   end
 
+  defp capacity_wait_entry?(%{} = retry_entry) do
+    delay_type = Map.get(retry_entry, :delay_type)
+
+    delay_type in [:slot_wait, "slot_wait"] ||
+      Map.get(retry_entry, :error) == "waiting for available orchestrator slot"
+  end
+
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
     secs = div(due_in_ms, 1000)
     millis = rem(due_in_ms, 1000)
@@ -679,6 +712,18 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp next_in_words(_), do: "n/a"
+
+  defp format_tracker_backoff_line(%{reason: :linear_rate_limited, delay_ms: delay_ms}) do
+    colorize("│ Tracker backoff: ", @ansi_bold) <>
+      colorize("Linear rate limited; next poll in #{next_in_words(delay_ms)}", @ansi_yellow)
+  end
+
+  defp format_tracker_backoff_line(%{"reason" => "linear_rate_limited", "delay_ms" => delay_ms}) do
+    colorize("│ Tracker backoff: ", @ansi_bold) <>
+      colorize("Linear rate limited; next poll in #{next_in_words(delay_ms)}", @ansi_yellow)
+  end
+
+  defp format_tracker_backoff_line(_backoff), do: []
 
   defp format_retry_error(error) when is_binary(error) do
     sanitized =
@@ -1363,6 +1408,18 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_method("tool/requestUserInput", payload),
     do: humanize_codex_method("item/tool/requestUserInput", payload)
+
+  defp humanize_codex_method("mcpServer/elicitation/request", payload) do
+    question =
+      map_path(payload, ["params", "question"]) ||
+        map_path(payload, ["params", "prompt"])
+
+    if is_binary(question) and String.trim(question) != "" do
+      "MCP server requires user input: #{inline_text(question)}"
+    else
+      "MCP server requires user input"
+    end
+  end
 
   defp humanize_codex_method("account/updated", payload) do
     auth_mode =
