@@ -161,6 +161,22 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_info({:agent_run_completed, issue_id, completion}, %{running: running} = state)
+      when is_binary(issue_id) and is_map(completion) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_running_entry =
+          running_entry
+          |> Map.put(:completion, completion)
+          |> maybe_put_completion_issue(completion)
+
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
   def handle_info(
         {:codex_worker_update, issue_id, %{event: _, timestamp: _} = update},
         %{running: running} = state
@@ -203,19 +219,46 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    cond do
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      workspace_preflight_refused_completion?(running_entry) ->
+        block_completed_agent_down(
+          state,
+          issue_id,
+          running_entry,
+          session_id,
+          preflight_refusal_error(running_entry)
+        )
+
+      max_turns_active_completion?(running_entry) ->
+        block_completed_agent_down(
+          state,
+          issue_id,
+          running_entry,
+          session_id,
+          max_turns_active_error(running_entry)
+        )
+
+      issue_done_completion?(running_entry) ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; issue left active work")
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
+      true ->
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
     end
   end
 
@@ -230,6 +273,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
 
+    Logger.warning("Agent task blocked for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}: #{error}")
+
+    block_issue_from_entry(state, issue_id, running_entry, error)
+  end
+
+  defp block_completed_agent_down(state, issue_id, running_entry, session_id, error) do
     Logger.warning("Agent task blocked for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}: #{error}")
 
     block_issue_from_entry(state, issue_id, running_entry, error)
@@ -429,6 +478,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
+  def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
+    reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
@@ -512,7 +567,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
-        refresh_blocked_issue_state(state, issue)
+        maybe_release_updated_blocked_issue(state, issue)
 
       true ->
         Logger.info("Blocked issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; releasing block")
@@ -521,6 +576,39 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp maybe_release_updated_blocked_issue(%State{} = state, %Issue{id: issue_id} = issue)
+       when is_binary(issue_id) do
+    case Map.get(state.blocked, issue_id) do
+      nil ->
+        state
+
+      blocked_entry ->
+        if issue_updated_after_block?(issue, blocked_entry) do
+          Logger.info("Blocked issue updated since block: #{issue_context(issue)}; releasing block for a fresh dispatch")
+          release_issue_claim(state, issue_id)
+        else
+          refresh_blocked_issue_state(state, issue)
+        end
+    end
+  end
+
+  defp maybe_release_updated_blocked_issue(%State{} = state, _issue), do: state
+
+  defp issue_updated_after_block?(%Issue{updated_at: %DateTime{} = updated_at}, blocked_entry)
+       when is_map(blocked_entry) do
+    blocked_issue_updated_at =
+      case Map.get(blocked_entry, :issue) do
+        %Issue{updated_at: %DateTime{} = previous_updated_at} -> previous_updated_at
+        _ -> nil
+      end
+
+    baseline = blocked_issue_updated_at || Map.get(blocked_entry, :blocked_at)
+
+    match?(%DateTime{}, baseline) and DateTime.compare(updated_at, baseline) == :gt
+  end
+
+  defp issue_updated_after_block?(_issue, _blocked_entry), do: false
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -712,6 +800,55 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp input_required_blocker?(_running_entry), do: false
 
+  defp workspace_preflight_refused_completion?(running_entry) when is_map(running_entry) do
+    completion_outcome(running_entry) == :workspace_preflight_refused
+  end
+
+  defp workspace_preflight_refused_completion?(_running_entry), do: false
+
+  defp max_turns_active_completion?(running_entry) when is_map(running_entry) do
+    completion_outcome(running_entry) == :max_turns_active
+  end
+
+  defp max_turns_active_completion?(_running_entry), do: false
+
+  defp issue_done_completion?(running_entry) when is_map(running_entry) do
+    completion_outcome(running_entry) == :issue_done
+  end
+
+  defp issue_done_completion?(_running_entry), do: false
+
+  defp completion_outcome(running_entry) when is_map(running_entry) do
+    running_entry
+    |> Map.get(:completion)
+    |> completion_map_value(:outcome)
+    |> normalize_completion_outcome()
+  end
+
+  defp completion_outcome(_running_entry), do: nil
+
+  defp normalize_completion_outcome(outcome) when is_atom(outcome), do: outcome
+
+  defp normalize_completion_outcome(outcome) when is_binary(outcome) do
+    case outcome |> String.trim() |> String.downcase() |> String.replace("-", "_") do
+      "workspace_preflight_refused" -> :workspace_preflight_refused
+      "max_turns_active" -> :max_turns_active
+      "issue_done" -> :issue_done
+      "input_required" -> :input_required
+      "needs_input" -> :needs_input
+      "approval_required" -> :approval_required
+      _ -> nil
+    end
+  end
+
+  defp normalize_completion_outcome(_outcome), do: nil
+
+  defp completion_map_value(completion, key) when is_map(completion) and is_atom(key) do
+    Map.get(completion, key) || Map.get(completion, Atom.to_string(key))
+  end
+
+  defp completion_map_value(_completion, _key), do: nil
+
   defp input_required_completion_outcome(completion) when is_map(completion) do
     outcome = Map.get(completion, :outcome) || Map.get(completion, "outcome")
     normalize_input_required_outcome(outcome)
@@ -761,6 +898,56 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp preflight_refusal_error(running_entry) do
+    output =
+      running_entry
+      |> Map.get(:completion)
+      |> completion_map_value(:output)
+
+    detail = preflight_refusal_detail(output)
+
+    if is_binary(detail) and detail != "" do
+      "workspace preflight refused autonomous work: #{detail}"
+    else
+      "workspace preflight refused autonomous work"
+    end
+  end
+
+  defp preflight_refusal_detail(output) when is_binary(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.reverse()
+    |> Enum.find_value(fn line ->
+      trimmed = String.trim(line)
+
+      if String.contains?(trimmed, "preflight refused") do
+        truncate_blocker_detail(trimmed)
+      end
+    end)
+  end
+
+  defp preflight_refusal_detail(_output), do: nil
+
+  defp max_turns_active_error(running_entry) do
+    completion = Map.get(running_entry, :completion)
+    turn_number = completion_map_value(completion, :turn_number)
+    max_turns = completion_map_value(completion, :max_turns)
+
+    if is_integer(turn_number) and is_integer(max_turns) do
+      "agent reached max_turns (#{turn_number}/#{max_turns}) with issue still active; waiting for issue update or operator review"
+    else
+      "agent reached max_turns with issue still active; waiting for issue update or operator review"
+    end
+  end
+
+  defp truncate_blocker_detail(detail) when is_binary(detail) do
+    if String.length(detail) > 500 do
+      String.slice(detail, 0, 500) <> "... (truncated)"
+    else
+      detail
+    end
+  end
+
   defp codex_message_method(%{message: %{"method" => method}}) when is_binary(method), do: method
   defp codex_message_method(%{message: %{method: method}}) when is_binary(method), do: method
   defp codex_message_method(%{"method" => method}) when is_binary(method), do: method
@@ -806,6 +993,7 @@ defmodule SymphonyElixir.Orchestrator do
       session_id: running_entry_session_id(running_entry),
       error: error,
       blocked_at: DateTime.utc_now(),
+      completion: Map.get(running_entry, :completion),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
       last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
@@ -1291,6 +1479,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
   end
+
+  defp maybe_put_completion_issue(running_entry, %{issue: %Issue{} = issue}) when is_map(running_entry) do
+    Map.put(running_entry, :issue, issue)
+  end
+
+  defp maybe_put_completion_issue(running_entry, %{"issue" => %Issue{} = issue}) when is_map(running_entry) do
+    Map.put(running_entry, :issue, issue)
+  end
+
+  defp maybe_put_completion_issue(running_entry, _completion), do: running_entry
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 

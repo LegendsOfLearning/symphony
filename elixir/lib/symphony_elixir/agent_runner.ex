@@ -17,7 +17,8 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-      :ok ->
+      {:ok, completion} ->
+        send_agent_completion(codex_update_recipient, issue, completion)
         :ok
 
       {:error, reason} ->
@@ -34,8 +35,22 @@ defmodule SymphonyElixir.AgentRunner do
         send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
         try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          case Workspace.run_before_run_hook(workspace, issue, worker_host) do
+            :ok ->
+              run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+
+            {:error, {:workspace_hook_failed, "before_run", 64, output} = reason} ->
+              {:ok,
+               %{
+                 outcome: :workspace_preflight_refused,
+                 hook: "before_run",
+                 status: 64,
+                 output: output,
+                 reason: reason
+               }}
+
+            {:error, reason} ->
+              {:error, reason}
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -59,6 +74,14 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
+
+  defp send_agent_completion(recipient, %Issue{id: issue_id}, completion)
+       when is_binary(issue_id) and is_pid(recipient) and is_map(completion) do
+    send(recipient, {:agent_run_completed, issue_id, completion})
+    :ok
+  end
+
+  defp send_agent_completion(_recipient, _issue, _completion), do: :ok
 
   defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
@@ -119,10 +142,22 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          :ok
+          {:ok,
+           %{
+             outcome: :max_turns_active,
+             issue: refreshed_issue,
+             turn_number: turn_number,
+             max_turns: max_turns
+           }}
 
-        {:done, _refreshed_issue} ->
-          :ok
+        {:done, refreshed_issue} ->
+          {:ok,
+           %{
+             outcome: :issue_done,
+             issue: refreshed_issue,
+             turn_number: turn_number,
+             max_turns: max_turns
+           }}
 
         {:error, reason} ->
           {:error, reason}
