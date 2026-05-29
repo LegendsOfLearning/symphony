@@ -346,6 +346,7 @@ defmodule SymphonyElixir.StatusDashboard do
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
+        tracker_backoff_line = format_tracker_backoff_line(Map.get(snapshot, :tracker_backoff))
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
@@ -363,6 +364,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           tracker_backoff_line,
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
@@ -710,6 +712,18 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp next_in_words(_), do: "n/a"
+
+  defp format_tracker_backoff_line(%{reason: :linear_rate_limited, delay_ms: delay_ms}) do
+    colorize("│ Tracker backoff: ", @ansi_bold) <>
+      colorize("Linear rate limited; next poll in #{next_in_words(delay_ms)}", @ansi_yellow)
+  end
+
+  defp format_tracker_backoff_line(%{"reason" => "linear_rate_limited", "delay_ms" => delay_ms}) do
+    colorize("│ Tracker backoff: ", @ansi_bold) <>
+      colorize("Linear rate limited; next poll in #{next_in_words(delay_ms)}", @ansi_yellow)
+  end
+
+  defp format_tracker_backoff_line(_backoff), do: []
 
   defp format_retry_error(error) when is_binary(error) do
     sanitized =

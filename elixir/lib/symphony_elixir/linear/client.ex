@@ -167,16 +167,36 @@ defmodule SymphonyElixir.Linear.Client do
     request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
 
     with {:ok, headers} <- graphql_headers(),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
+         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers),
+         :ok <- classify_linear_graphql_body(body) do
       {:ok, body}
     else
-      {:ok, response} ->
-        Logger.error(
-          "Linear GraphQL request failed status=#{response.status}" <>
-            linear_error_context(payload, response)
+      {:error, {:linear_rate_limited, details}} ->
+        Logger.warning(
+          "Linear GraphQL request rate limited" <>
+            linear_rate_limit_context(payload, details)
         )
 
-        {:error, {:linear_api_status, response.status}}
+        {:error, {:linear_rate_limited, details}}
+
+      {:ok, response} ->
+        case classify_linear_graphql_body(response.body) do
+          {:error, {:linear_rate_limited, details}} ->
+            Logger.warning(
+              "Linear GraphQL request rate limited status=#{response.status}" <>
+                linear_rate_limit_context(payload, details)
+            )
+
+            {:error, {:linear_rate_limited, details}}
+
+          _ ->
+            Logger.error(
+              "Linear GraphQL request failed status=#{response.status}" <>
+                linear_error_context(payload, response)
+            )
+
+            {:error, {:linear_api_status, response.status}}
+        end
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
@@ -385,6 +405,82 @@ defmodule SymphonyElixir.Linear.Client do
     operation_name <> " body=" <> body
   end
 
+  defp linear_rate_limit_context(payload, details) when is_map(payload) do
+    operation_name =
+      case Map.get(payload, "operationName") do
+        name when is_binary(name) and name != "" -> " operation=#{name}"
+        _ -> ""
+      end
+
+    operation_name <> " details=" <> inspect(details)
+  end
+
+  defp classify_linear_graphql_body(%{"errors" => errors}) when is_list(errors) do
+    case linear_rate_limit_details(errors) do
+      nil -> :ok
+      details -> {:error, {:linear_rate_limited, details}}
+    end
+  end
+
+  defp classify_linear_graphql_body(%{errors: errors}) when is_list(errors) do
+    case linear_rate_limit_details(errors) do
+      nil -> :ok
+      details -> {:error, {:linear_rate_limited, details}}
+    end
+  end
+
+  defp classify_linear_graphql_body(_body), do: :ok
+
+  defp linear_rate_limit_details(errors) when is_list(errors) do
+    Enum.find_value(errors, fn error ->
+      code = error_extension(error, "code")
+
+      if rate_limit_code?(code) do
+        %{
+          code: code,
+          message: error_message(error),
+          limit: error_extension(error, "limit"),
+          remaining: error_extension(error, "remaining"),
+          duration_ms: error_extension(error, "durationMs") || error_extension(error, "duration_ms"),
+          retry_after_ms: error_extension(error, "retryAfterMs") || error_extension(error, "retry_after_ms"),
+          reset_at: error_extension(error, "resetAt") || error_extension(error, "reset_at")
+        }
+        |> reject_nil_values()
+      end
+    end)
+  end
+
+  defp linear_rate_limit_details(_errors), do: nil
+
+  defp error_message(%{"message" => message}) when is_binary(message), do: message
+  defp error_message(%{message: message}) when is_binary(message), do: message
+  defp error_message(_error), do: nil
+
+  defp error_extension(error, key) when is_map(error) and is_binary(key) do
+    extensions =
+      case Map.get(error, "extensions") || Map.get(error, :extensions) do
+        value when is_map(value) -> value
+        _ -> %{}
+      end
+
+    Map.get(extensions, key) || Map.get(extensions, String.to_atom(key))
+  end
+
+  defp rate_limit_code?(code) when is_binary(code) do
+    code
+    |> String.trim()
+    |> String.upcase()
+    |> then(&(&1 in ["RATELIMITED", "RATE_LIMITED"]))
+  end
+
+  defp rate_limit_code?(_code), do: false
+
+  defp reject_nil_values(map) when is_map(map) do
+    map
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
   defp summarize_error_body(body) when is_binary(body) do
     body
     |> String.replace(~r/\s+/, " ")
@@ -440,7 +536,10 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp decode_linear_response(%{"errors" => errors}, _assignee_filter, _label_filter) do
-    {:error, {:linear_graphql_errors, errors}}
+    case linear_rate_limit_details(errors) do
+      nil -> {:error, {:linear_graphql_errors, errors}}
+      details -> {:error, {:linear_rate_limited, details}}
+    end
   end
 
   defp decode_linear_response(_unknown, _assignee_filter, _label_filter) do

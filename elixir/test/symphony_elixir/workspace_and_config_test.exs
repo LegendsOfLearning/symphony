@@ -497,6 +497,55 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client classifies Linear rate limits instead of generic graphql failures" do
+    assert {:error, {:linear_rate_limited, details}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_fun: fn _payload, _headers ->
+                 {:ok,
+                  %{
+                    status: 400,
+                    body: %{
+                      "errors" => [
+                        %{
+                          "message" => "Rate limit exceeded",
+                          "extensions" => %{
+                            "code" => "RATELIMITED",
+                            "limit" => 2500,
+                            "remaining" => 0,
+                            "duration_ms" => 3_600_000
+                          }
+                        }
+                      ]
+                    }
+                  }}
+               end
+             )
+
+    assert details.code == "RATELIMITED"
+    assert details.limit == 2500
+    assert details.remaining == 0
+    assert details.duration_ms == 3_600_000
+  end
+
+  test "linear issue decoders preserve rate limit details from graphql error payloads" do
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "errors" => [
+           %{
+             "message" => "Rate limit exceeded",
+             "extensions" => %{"code" => "RATELIMITED", "durationMs" => "60000"}
+           }
+         ]
+       }}
+    end
+
+    assert {:error, {:linear_rate_limited, %{duration_ms: "60000"}}} =
+             Client.fetch_issue_states_by_ids_for_test(["issue-1"], graphql_fun)
+  end
+
   test "orchestrator sorts dispatch by priority then oldest created_at" do
     issue_same_priority_older = %Issue{
       id: "issue-old-high",

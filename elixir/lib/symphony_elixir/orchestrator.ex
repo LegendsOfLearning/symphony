@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Orchestrator do
   @continuation_retry_delay_ms 1_000
   @slot_wait_retry_delay_ms 5_000
   @failure_retry_base_ms 10_000
+  @linear_rate_limit_default_backoff_ms 300_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -34,6 +35,8 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :next_poll_delay_ms,
+      :tracker_backoff,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -111,7 +114,8 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
+    {poll_delay_ms, state} = pop_next_poll_delay(state)
+    state = schedule_tick(state, poll_delay_ms)
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
@@ -253,7 +257,7 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      choose_issues(issues, %{state | tracker_backoff: nil})
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -277,6 +281,21 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Invalid WORKFLOW.md config: #{message}")
         state
 
+      {:error, {:linear_rate_limited, details}} ->
+        delay_ms = linear_rate_limit_backoff_ms(details, state.poll_interval_ms)
+
+        Logger.warning("Linear API rate limited; backing off project polling for #{delay_ms}ms details=#{inspect(details)}")
+
+        %{
+          state
+          | next_poll_delay_ms: delay_ms,
+            tracker_backoff: %{
+              reason: :linear_rate_limited,
+              delay_ms: delay_ms,
+              details: details
+            }
+        }
+
       {:error, {:missing_workflow_file, path, reason}} ->
         Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
         state
@@ -297,6 +316,58 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp pop_next_poll_delay(%State{next_poll_delay_ms: delay_ms} = state)
+       when is_integer(delay_ms) and delay_ms > 0 do
+    {delay_ms, %{state | next_poll_delay_ms: nil}}
+  end
+
+  defp pop_next_poll_delay(%State{} = state), do: {state.poll_interval_ms, %{state | next_poll_delay_ms: nil}}
+
+  @doc false
+  @spec linear_rate_limit_backoff_ms_for_test(map(), pos_integer()) :: pos_integer()
+  def linear_rate_limit_backoff_ms_for_test(details, poll_interval_ms) do
+    linear_rate_limit_backoff_ms(details, poll_interval_ms)
+  end
+
+  defp linear_rate_limit_backoff_ms(details, poll_interval_ms) do
+    details
+    |> linear_rate_limit_backoff_candidates()
+    |> Enum.find(&positive_integer?/1)
+    |> case do
+      nil -> max(poll_interval_ms, @linear_rate_limit_default_backoff_ms)
+      value -> max(value, poll_interval_ms)
+    end
+  end
+
+  defp linear_rate_limit_backoff_candidates(details) when is_map(details) do
+    [
+      Map.get(details, :retry_after_ms),
+      Map.get(details, "retry_after_ms"),
+      Map.get(details, :retryAfterMs),
+      Map.get(details, "retryAfterMs"),
+      Map.get(details, :duration_ms),
+      Map.get(details, "duration_ms"),
+      Map.get(details, :durationMs),
+      Map.get(details, "durationMs")
+    ]
+    |> Enum.map(&parse_positive_integer/1)
+  end
+
+  defp linear_rate_limit_backoff_candidates(_details), do: []
+
+  defp parse_positive_integer(value) when is_integer(value), do: value
+
+  defp parse_positive_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _ -> nil
+    end
+  end
+
+  defp parse_positive_integer(_value), do: nil
+
+  defp positive_integer?(value), do: is_integer(value) and value > 0
 
   defp reconcile_running_issues(%State{} = state) do
     state = reconcile_stalled_running_issues(state)
@@ -1423,6 +1494,7 @@ defmodule SymphonyElixir.Orchestrator do
        blocked: blocked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       tracker_backoff: Map.get(state, :tracker_backoff),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
